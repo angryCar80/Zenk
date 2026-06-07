@@ -66,7 +66,7 @@ int main(int argc, char *argv[]) {
   SDL_Init(SDL_INIT_VIDEO);
   TTF_Init();
 
-  SDL_Window *window = SDL_CreateWindow("Cim", 800, 800, SDL_WINDOW_RESIZABLE);
+  SDL_Window *window = SDL_CreateWindow("Zenk", 800, 800, SDL_WINDOW_RESIZABLE);
   SDL_Renderer *renderer = SDL_CreateRenderer(window, 0);
 
   TTF_Font *font = TTF_OpenFont("./fonts/code_font.ttf", 16);
