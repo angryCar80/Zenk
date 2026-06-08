@@ -13,6 +13,7 @@
 #include <SDL3/SDL_video.h>
 #include <SDL3_ttf/SDL_ttf.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 int CHAR_WIDTH = 8;
@@ -43,6 +44,7 @@ void DrawChar(SDL_Renderer *renderer, SDL_Texture *fontTexture, char c, int x,
 }
 
 int min(int a, int b) { return a < b ? a : b; }
+int max(int a, int b) { return a > b ? a : b; }
 
 int main(int argc, char *argv[]) {
   Cursor cursor;
@@ -107,6 +109,9 @@ int main(int argc, char *argv[]) {
   // Vim Keymaps needed
   char pending_operator = 0;
   char *yank_buffer = NULL;
+  // Visual Mode
+  int visual_anchor_row = 0;
+  int visual_anchor_col = 0;
   // Main Loop
   while (running) {
     int w, h;
@@ -190,12 +195,7 @@ int main(int argc, char *argv[]) {
           if (cursor_row >= buf.line_count)
             cursor_row = buf.line_count - 1;
         }
-
-        if (user.state == NORMAL) {
-          if (pending_operator != 0 && event.key.key != SDLK_D &&
-              event.key.key != SDLK_Y) {
-            pending_operator = 0;
-          }
+        if (user.state != INSERT) {
           if (event.key.key == SDLK_H) {
             if (cursor_col > 0) {
               cursor_col--;
@@ -222,9 +222,22 @@ int main(int argc, char *argv[]) {
             int line_len = strlen(buf.lines[cursor_row]);
             cursor_col = min(cursor_col_target, line_len);
           }
+        }
+        if (user.state == NORMAL) {
+          if (pending_operator != 0 && event.key.key != SDLK_D &&
+              event.key.key != SDLK_Y) {
+            pending_operator = 0;
+          }
+          // SWITCHING MODE TO INSERT
           if (event.key.key == SDLK_I) {
             user.state = INSERT;
             swallow_text = true;
+          }
+          // SWITCHING MODE TO VISUAL
+          if (event.key.key == SDLK_V) {
+            visual_anchor_row = cursor_row;
+            visual_anchor_col = cursor_col;
+            user.state = VISUAL;
           }
           if (event.key.key == SDLK_X) {
             buffer_delete_char(&buf, cursor_row, cursor_col);
@@ -240,13 +253,38 @@ int main(int argc, char *argv[]) {
             } else {
               pending_operator = 'd';
             }
+          } else if (event.key.key == SDLK_Y) {
+            if (pending_operator == 'y') {
+              free(yank_buffer);
+              yank_buffer = malloc(strlen(buf.lines[cursor_row]) + 1);
+              strcpy(yank_buffer, buf.lines[cursor_row]);
+              pending_operator = 0;
+            } else {
+              pending_operator = 'y';
+            }
           } else {
             pending_operator = 0;
+          }
+          // --- Paste Command ---
+          if (event.key.key == SDLK_P) {
+            if (yank_buffer) {
+              buffer_insert_line(&buf, cursor_row + 1);
+              free(buf.lines[cursor_row + 1]);
+              buf.lines[cursor_row + 1] = malloc(strlen(yank_buffer) + 1);
+              strcpy(buf.lines[cursor_row + 1], yank_buffer);
+              cursor_row++;
+              cursor_col = 0;
+            }
           }
           if (event.key.key == SDLK_O) {
             buffer_insert_line(&buf, cursor_row);
             user.state = INSERT;
             cursor_row++;
+            swallow_text = true;
+          }
+          if (event.key.key == SDLK_A) {
+            cursor_col = strlen(buf.lines[cursor_row]);
+            user.state = INSERT;
             swallow_text = true;
           }
         }
@@ -286,6 +324,122 @@ int main(int argc, char *argv[]) {
 
             cursor_row++;
             cursor_col = 0;
+          }
+        }
+        if (user.state == VISUAL) {
+          if (event.key.key == SDLK_D || event.key.key == SDLK_X) {
+            // Normalize selection range (smaller → larger)
+            int sr = min(visual_anchor_row, cursor_row);
+            int er = max(visual_anchor_row, cursor_row);
+            int sc = (visual_anchor_row == cursor_row)
+                         ? min(visual_anchor_col, cursor_col)
+                         : (visual_anchor_row < cursor_row ? visual_anchor_col
+                                                           : cursor_col);
+            int ec = (visual_anchor_row == cursor_row)
+                         ? max(visual_anchor_col, cursor_col)
+                         : (visual_anchor_row > cursor_row ? visual_anchor_col
+                                                           : cursor_col);
+
+            // Yank the deleted text (for pasting later)
+            free(yank_buffer);
+            if (sr == er) {
+              // Same line: copy range, shift content left
+              int range = ec - sc;
+              yank_buffer = malloc(range + 1);
+              memcpy(yank_buffer, buf.lines[sr] + sc, range);
+              yank_buffer[range] = '\0';
+
+              int len = strlen(buf.lines[sr]);
+              memmove(buf.lines[sr] + sc, buf.lines[sr] + ec, len - ec + 1);
+              buf.lines[sr] = realloc(buf.lines[sr], len - range + 1);
+            } else {
+              // Multi-line: copy everything into yank_buffer with \n
+              int tail_len = strlen(buf.lines[sr]) - sc;
+              int yank_size = tail_len + 1; // first line tail + \n
+              for (int i = sr + 1; i < er; i++)
+                yank_size += strlen(buf.lines[i]) + 1; // middle lines + \n
+              yank_size += ec + 1;                     // end row head + null
+
+              yank_buffer = malloc(yank_size);
+              int pos = 0;
+              memcpy(yank_buffer + pos, buf.lines[sr] + sc, tail_len);
+              pos += tail_len;
+              yank_buffer[pos++] = '\n';
+              for (int i = sr + 1; i < er; i++) {
+                int len = strlen(buf.lines[i]);
+                memcpy(yank_buffer + pos, buf.lines[i], len);
+                pos += len;
+                yank_buffer[pos++] = '\n';
+              }
+              memcpy(yank_buffer + pos, buf.lines[er], ec);
+              pos += ec;
+              yank_buffer[pos] = '\0';
+
+              // Delete: append end row's tail to start row
+              int end_tail_len = strlen(buf.lines[er]) - ec;
+              buf.lines[sr] = realloc(buf.lines[sr], sc + end_tail_len + 1);
+              memcpy(buf.lines[sr] + sc, buf.lines[er] + ec, end_tail_len);
+              buf.lines[sr][sc + end_tail_len] = '\0';
+
+              // Free all lines from sr+1 to er
+              for (int i = sr + 1; i <= er; i++)
+                free(buf.lines[i]);
+              // Shift remaining lines down
+              int lines_to_remove = er - sr;
+              memmove(&buf.lines[sr + 1], &buf.lines[er + 1],
+                      sizeof(char *) * (buf.line_count - er - 1));
+              buf.line_count -= lines_to_remove;
+            }
+
+            cursor_row = sr;
+            cursor_col = sc;
+            cursor_col_target = sc;
+            user.state = NORMAL;
+          }
+
+          if (event.key.key == SDLK_Y) {
+            // Same yank logic as above, but NO deletion — just copy and exit
+            int sr = min(visual_anchor_row, cursor_row);
+            int er = max(visual_anchor_row, cursor_row);
+            int sc = (visual_anchor_row == cursor_row)
+                         ? min(visual_anchor_col, cursor_col)
+                         : (visual_anchor_row < cursor_row ? visual_anchor_col
+                                                           : cursor_col);
+            int ec = (visual_anchor_row == cursor_row)
+                         ? max(visual_anchor_col, cursor_col)
+                         : (visual_anchor_row > cursor_row ? visual_anchor_col
+                                                           : cursor_col);
+
+            free(yank_buffer);
+            if (sr == er) {
+              int range = ec - sc;
+              yank_buffer = malloc(range + 1);
+              memcpy(yank_buffer, buf.lines[sr] + sc, range);
+              yank_buffer[range] = '\0';
+            } else {
+              int tail_len = strlen(buf.lines[sr]) - sc;
+              int yank_size = tail_len + 1;
+              for (int i = sr + 1; i < er; i++)
+                yank_size += strlen(buf.lines[i]) + 1;
+              yank_size += ec + 1;
+
+              yank_buffer = malloc(yank_size);
+              int pos = 0;
+              memcpy(yank_buffer + pos, buf.lines[sr] + sc, tail_len);
+              pos += tail_len;
+              yank_buffer[pos++] = '\n';
+              for (int i = sr + 1; i < er; i++) {
+                int len = strlen(buf.lines[i]);
+                memcpy(yank_buffer + pos, buf.lines[i], len);
+                pos += len;
+                yank_buffer[pos++] = '\n';
+              }
+              memcpy(yank_buffer + pos, buf.lines[er], ec);
+              pos += ec;
+              yank_buffer[pos] = '\0';
+            }
+
+            user.state = NORMAL;
           }
         }
         if (user.state == COMMAND) {
@@ -343,6 +497,38 @@ int main(int argc, char *argv[]) {
       // draw text content
       int line_len = strlen(buf.lines[i]);
       for (int j = 0; j < line_len; j++) {
+        // Selection highlight
+        if (user.state == VISUAL) {
+          int sr = min(visual_anchor_row, cursor_row);
+          int er = max(visual_anchor_row, cursor_row);
+          int sc = (visual_anchor_row == cursor_row)
+                       ? min(visual_anchor_col, cursor_col)
+                       : (visual_anchor_row < cursor_row ? visual_anchor_col
+                                                         : cursor_col);
+          int ec = (visual_anchor_row == cursor_row)
+                       ? max(visual_anchor_col, cursor_col)
+                       : (visual_anchor_row > cursor_row ? visual_anchor_col
+                                                         : cursor_col);
+          bool selected = false;
+          if (i > sr && i < er) {
+            selected = true;
+          } else if (i == sr && i == er) {
+            if (j >= sc && j < ec)
+              selected = true;
+          } else if (i == sr) {
+            if (j >= sc)
+              selected = true;
+          } else if (i == er) {
+            if (j < ec)
+              selected = true;
+          }
+          if (selected) {
+            SDL_SetRenderDrawColor(renderer, 60, 60, 120, 255);
+            SDL_FRect bg = {GUTTER_WIDTH + j * CHAR_WIDTH, y, CHAR_WIDTH,
+                            CHAR_HEIGHT};
+            SDL_RenderFillRect(renderer, &bg);
+          }
+        }
         DrawChar(renderer, fontTexture, buf.lines[i][j],
                  GUTTER_WIDTH + j * CHAR_WIDTH, y);
       }

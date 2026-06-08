@@ -3,6 +3,9 @@
 A vim-like code editor built from scratch in C with SDL3.
 Its made to code in C and C++.
 
+and am tired of these editors, the big support of AI from every new editor
+with the hard process of configuring neovim and emacs
+
 ## Features
 
 - Vim-style modes: NORMAL, INSERT, COMMAND, VISUAL
@@ -16,13 +19,13 @@ Its made to code in C and C++.
 ## Build
 
 ```bash
-	make
+make
 ```
 
 ## Usage
 
 ```bash
-	make run
+make run
 ```
 
 ## Dependencies

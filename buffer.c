@@ -97,16 +97,16 @@ void buffer_save(Buffer *buf, const char *path) {
     return;
   }
   for (int i = 0; i < buf->line_count; i++) {
- 	fprintf(f, "%s\n", buf->lines[i]);
+    fprintf(f, "%s\n", buf->lines[i]);
   }
   fclose(f);
 }
 
 void buffer_delete_line(Buffer *buf, int row) {
-	if(buf->line_count <= 1){
-		return;
-	}
-	free(buf->lines[row]);
+  if (buf->line_count <= 1) {
+    return;
+  }
+  free(buf->lines[row]);
 
   memmove(&buf->lines[row], &buf->lines[row + 1],
           sizeof(char *) * (buf->line_count - row - 1));
