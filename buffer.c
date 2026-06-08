@@ -113,3 +113,19 @@ void buffer_delete_line(Buffer *buf, int row) {
 
   buf->line_count--;
 }
+
+Buffer buffer_clone(Buffer *src) {
+  Buffer c;
+  c.line_count = src->line_count;
+  c.capacity = src->capacity;
+  c.lines = malloc(sizeof(char *) * c.capacity);
+  for (int i = 0; i < c.line_count; i++)
+    c.lines[i] = strdup(src->lines[i]);
+  return c;
+}
+
+void buffer_destroy_clone(Buffer *buf) {
+  for (int i = 0; i < buf->line_count; i++)
+    free(buf->lines[i]);
+  free(buf->lines);
+}

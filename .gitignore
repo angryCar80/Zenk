@@ -2,3 +2,4 @@ build/
 *.o
 *.exe
 *.bin
+test.c

@@ -19,5 +19,7 @@ void buffer_delete_line(Buffer *buf, int row);
 void buffer_destroy(Buffer *buf);
 Buffer buffer_load(const char *path);
 void buffer_save(Buffer *buf, const char *path);
+Buffer buffer_clone(Buffer *src);
+void buffer_destroy_clone(Buffer *buf);
 
 #endif
