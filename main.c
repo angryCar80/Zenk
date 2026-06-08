@@ -1,6 +1,7 @@
 #include "buffer.h"
 #include "user.h"
 #include <SDL3/SDL.h>
+#include <SDL3/SDL_error.h>
 #include <SDL3/SDL_events.h>
 #include <SDL3/SDL_init.h>
 #include <SDL3/SDL_keyboard.h>
@@ -196,6 +197,7 @@ int main(int argc, char *argv[]) {
             cursor_row = buf.line_count - 1;
         }
         if (user.state != INSERT) {
+
           if (event.key.key == SDLK_H) {
             if (cursor_col > 0) {
               cursor_col--;
@@ -227,6 +229,65 @@ int main(int argc, char *argv[]) {
           if (pending_operator != 0 && event.key.key != SDLK_D &&
               event.key.key != SDLK_Y) {
             pending_operator = 0;
+          }
+          if (event.key.key == SDLK_W) {
+            int line_len = strlen(buf.lines[cursor_row]);
+            int pos = cursor_col;
+
+            while (pos < line_len) {
+              char c = buf.lines[cursor_row][pos];
+              if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') || c == '_') {
+                pos++;
+              } else {
+                break;
+              }
+            }
+            while (pos < line_len) {
+              char c = buf.lines[cursor_row][pos];
+              if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                    (c >= '0' && c <= '9') || c == '_')) {
+                pos++;
+              } else {
+                break;
+              }
+            }
+            if (pos < line_len) {
+              cursor_col = pos;
+              cursor_col_target = pos;
+            } else if (cursor_row < buf.line_count - 1) {
+              cursor_row++;
+              cursor_col = 0;
+              cursor_col_target = 0;
+            }
+          }
+          if (event.key.key == SDLK_B) {
+            if (cursor_col > 0) {
+              int pos = cursor_col - 1;
+
+              // Skip non-word chars backward
+              while (pos > 0) {
+                char c = buf.lines[cursor_row][pos];
+                if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                      (c >= '0' && c <= '9') || c == '_'))
+                  pos--;
+                else
+                  break;
+              }
+
+              // Skip word chars backward to find start of word
+              while (pos > 0) {
+                char c = buf.lines[cursor_row][pos - 1];
+                if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                    (c >= '0' && c <= '9') || c == '_')
+                  pos--;
+                else
+                  break;
+              }
+
+              cursor_col = pos;
+              cursor_col_target = pos;
+            }
           }
           // SWITCHING MODE TO INSERT
           if (event.key.key == SDLK_I) {
@@ -277,9 +338,17 @@ int main(int argc, char *argv[]) {
             }
           }
           if (event.key.key == SDLK_O) {
-            buffer_insert_line(&buf, cursor_row);
+            buffer_insert_line(&buf, cursor_row + 1);
             user.state = INSERT;
             cursor_row++;
+            cursor_col = 0;
+            swallow_text = true;
+          }
+          if (event.key.key == SDLK_O && (event.key.mod & SDL_KMOD_SHIFT)) {
+            // O — open line ABOVE
+            buffer_insert_line(&buf, cursor_row);
+            user.state = INSERT;
+            cursor_col = 0;
             swallow_text = true;
           }
           if (event.key.key == SDLK_A) {
@@ -289,6 +358,12 @@ int main(int argc, char *argv[]) {
           }
         }
         if (user.state == INSERT) {
+          if (event.key.key == SDLK_TAB) {
+            buffer_insert_char(&buf, cursor_row, cursor_col, ' ');
+            cursor_col++;
+            buffer_insert_char(&buf, cursor_row, cursor_col, ' ');
+            cursor_col++;
+          }
           if (event.key.key == SDLK_BACKSPACE) {
             if (cursor_col > 0) {
               buffer_delete_char(&buf, cursor_row, cursor_col);
@@ -309,13 +384,19 @@ int main(int argc, char *argv[]) {
           if (event.key.key == SDLK_RETURN) {
             int len = strlen(buf.lines[cursor_row]);
 
+            int indent = 0;
+            while (buf.lines[cursor_row][indent] == ' ' ||
+                   buf.lines[cursor_row][indent] == '\t') {
+              indent++;
+            }
             int tail_len = len - cursor_col;
-
             buffer_insert_line(&buf, cursor_row + 1);
 
-            char *new_line = malloc(tail_len + 1);
-            memcpy(new_line, buf.lines[cursor_row] + cursor_col, tail_len);
-            new_line[tail_len] = '\0';
+            char *new_line = malloc(indent + tail_len + 1);
+            memcpy(new_line, buf.lines[cursor_row], indent);
+            memcpy(new_line + indent, buf.lines[cursor_row] + cursor_col,
+                   tail_len);
+            new_line[indent + tail_len] = '\0';
             buf.lines[cursor_row + 1] = new_line;
 
             buf.lines[cursor_row] =
@@ -323,7 +404,7 @@ int main(int argc, char *argv[]) {
             buf.lines[cursor_row][cursor_col] = '\0';
 
             cursor_row++;
-            cursor_col = 0;
+            cursor_col = indent;
           }
         }
         if (user.state == VISUAL) {

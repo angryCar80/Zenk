@@ -34,8 +34,8 @@ make run
 - gcc, make
 
 ## Todos:
-- [ ] Add Visual Mode with highlighting
-- [ ] Add more Vim keymaps
+- [x] Add Visual Mode with highlighting (still needs improvment)
+- [x] Add more Vim keymaps (still needs more keymaps)
 - [ ] Add relative line number
 - [ ] Integrate LSP (clangd) for the editor with a formater
 - [ ] Have the usableity like tmux and
