@@ -19,6 +19,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
+#include <sys/stat.h>
 
 #define UNDO_MAX 100
 
@@ -40,6 +42,7 @@ int completion_selected = 0;
 
 int CHAR_WIDTH = 8;
 int CHAR_HEIGHT = 16;
+int GUTTER_WIDTH;
 
 typedef struct {
   float x;
@@ -265,25 +268,111 @@ void filter_completions(char *line, int col) {
     completion_selected = completion_count > 0 ? completion_count - 1 : 0;
 }
 
+void delete_inside(Buffer *buf, int *row, int *col, char pair) {
+  char open, close;
+  switch (pair) {
+    case '(': case ')': open = '('; close = ')'; break;
+    case '{': case '}': open = '{'; close = '}'; break;
+    case '[': case ']': open = '['; close = ']'; break;
+    case '"': open = '"'; close = '"'; break;
+    case '\'': open = '\''; close = '\''; break;
+    default: return;
+  }
+  int open_pos = -1, depth = 0;
+  for (int i = *col - 1; i >= 0; i--) {
+    if (open == close) {
+      if (buf->lines[*row][i] == open) { open_pos = i; break; }
+    } else {
+      if (buf->lines[*row][i] == close) depth++;
+      else if (buf->lines[*row][i] == open) {
+        if (depth == 0) { open_pos = i; break; }
+        depth--;
+      }
+    }
+  }
+  if (open_pos < 0) return;
+  int close_pos = -1;
+  depth = 0;
+  for (int i = open_pos + 1; buf->lines[*row][i]; i++) {
+    if (open == close) {
+      if (buf->lines[*row][i] == close) { close_pos = i; break; }
+    } else {
+      if (buf->lines[*row][i] == open) depth++;
+      else if (buf->lines[*row][i] == close) {
+        if (depth == 0) { close_pos = i; break; }
+        depth--;
+      }
+    }
+  }
+  if (close_pos < 0) return;
+  int count = close_pos - open_pos - 1;
+  for (int i = 0; i < count; i++)
+    buffer_delete_char(buf, *row, open_pos + 2);
+  *col = open_pos + 1;
+  if (*col < 0) *col = 0;
+}
+
+static int entry_cmp(const void *a, const void *b) {
+  return strcmp(*(const char **)a, *(const char **)b);
+}
+
+void load_directory(Buffer *buf, const char *path) {
+  DIR *d = opendir(path);
+  if (!d) return;
+  char **entries = NULL;
+  int count = 0, cap = 0;
+  struct dirent *entry;
+  while ((entry = readdir(d)) != NULL) {
+    if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+      continue;
+    if (count >= cap) {
+      cap = cap ? cap * 2 : 64;
+      entries = realloc(entries, sizeof(char *) * cap);
+    }
+    char full[1024];
+    snprintf(full, sizeof(full), "%s/%s", path, entry->d_name);
+    struct stat st;
+    int is_dir = (stat(full, &st) == 0 && S_ISDIR(st.st_mode));
+    char *line = malloc(strlen(entry->d_name) + 2);
+    sprintf(line, "%s%c", entry->d_name, is_dir ? '/' : ' ');
+    entries[count++] = line;
+  }
+  closedir(d);
+  qsort(entries, count, sizeof(char *), entry_cmp);
+  int total = count + 1;
+  char **all = malloc(sizeof(char *) * total);
+  all[0] = strdup("../");
+  for (int i = 0; i < count; i++) all[i + 1] = entries[i];
+  free(entries);
+  for (int i = 0; i < buf->line_count; i++) free(buf->lines[i]);
+  free(buf->lines);
+  buf->capacity = total;
+  buf->lines = all;
+  buf->line_count = total;
+}
+
 int main(int argc, char *argv[]) {
   Cursor cursor;
   Buffer buf;
 
-  char *filename = NULL;
+  char filename[512] = "";
   if (argc > 1) {
-    filename = argv[1];
+    strncpy(filename, argv[1], sizeof(filename) - 1);
     buf = buffer_load(filename);
   } else {
     buf = buffer_create(300);
   }
   LspClient *lsp = NULL;
-  if (filename) {
+  if (filename[0]) {
     lsp = lsp_init(filename);
     if (lsp)
       lsp_open(lsp, &buf);
   }
 
   User user = create_user();
+
+  int exploring = 0;
+  char explore_dir[512] = "";
 
   int cursor_row = 0;
   int cursor_col = 0;
@@ -300,6 +389,7 @@ int main(int argc, char *argv[]) {
 
   // int glyph_w, glyph_h;
   TTF_GetStringSize(font, "W", 1, &CHAR_WIDTH, &CHAR_HEIGHT);
+  GUTTER_WIDTH = 4 * CHAR_WIDTH;
 
   SDL_Surface *atlas =
       SDL_CreateSurface(CHAR_WIDTH * 95, CHAR_HEIGHT, SDL_PIXELFORMAT_RGBA8888);
@@ -330,9 +420,10 @@ int main(int argc, char *argv[]) {
   bool cursor_visible = true;
 
   // ECHO BUG FIXING
-  bool swallow_text = false;
+  Uint64 swallow_until = 0;
   // Vim Keymaps needed
   char pending_operator = 0;
+  char pending_motion = 0;
   char *yank_buffer = NULL;
   // Visual Mode
   int visual_anchor_row = 0;
@@ -366,23 +457,45 @@ int main(int argc, char *argv[]) {
         cursor_visible = true;
         blink_timer = SDL_GetTicks();
         if (user.state == INSERT) {
-          if (swallow_text) {
-            swallow_text = false;
-          } else if (event.text.text[0] >= 32) {
-            buffer_insert_char(&buf, cursor_row, cursor_col,
-                               event.text.text[0]);
-            cursor_col++;
-            if (lsp) {
-              lsp_change(lsp, &buf);
-            }
-            if (base_count > 0)
-              filter_completions(buf.lines[cursor_row], cursor_col);
-            if (lsp && completion_count == 0 &&
-                SDL_GetTicks() - last_completion_time > 120) {
-              lsp_request_completion(lsp, cursor_row, cursor_col);
-              last_completion_time = SDL_GetTicks();
+          if (swallow_until && SDL_GetTicks() < swallow_until) {
+            swallow_until = 0;
+          } else {
+            char c = event.text.text[0];
+            if (c == '(' || c == '{' || c == '[') {
+              char close = c == '(' ? ')' : c == '{' ? '}' : ']';
+              buffer_insert_char(&buf, cursor_row, cursor_col, c);
+              cursor_col++;
+              buffer_insert_char(&buf, cursor_row, cursor_col, close);
+              cursor_col--;
+              if (lsp) lsp_change(lsp, &buf);
+            } else if (c == '"' || c == '\'') {
+              buffer_insert_char(&buf, cursor_row, cursor_col, c);
+              cursor_col++;
+              buffer_insert_char(&buf, cursor_row, cursor_col, c);
+              cursor_col--;
+              if (lsp) lsp_change(lsp, &buf);
+              if (base_count > 0)
+                filter_completions(buf.lines[cursor_row], cursor_col);
+            } else if (c >= 32) {
+              buffer_insert_char(&buf, cursor_row, cursor_col, c);
+              cursor_col++;
+              if (lsp) lsp_change(lsp, &buf);
+              if (base_count > 0)
+                filter_completions(buf.lines[cursor_row], cursor_col);
+              if (lsp && completion_count == 0 &&
+                  SDL_GetTicks() - last_completion_time > 120) {
+                lsp_request_completion(lsp, cursor_row, cursor_col);
+                last_completion_time = SDL_GetTicks();
+              }
             }
           }
+        } else if (user.state == NORMAL && pending_motion == 'i' &&
+                   strchr("(){}[]\"'", event.text.text[0])) {
+          push_undo(&buf, cursor_row, cursor_col);
+          delete_inside(&buf, &cursor_row, &cursor_col, event.text.text[0]);
+          cursor_col_target = cursor_col;
+          pending_motion = 0;
+          if (lsp) lsp_change(lsp, &buf);
         } else if (user.state == NORMAL && event.text.text[0] == '$') {
           cursor_col = strlen(buf.lines[cursor_row]);
           cursor_col_target = cursor_col;
@@ -404,6 +517,26 @@ int main(int argc, char *argv[]) {
                    event.text.text[0] >= 32) {
           cmd_buf[cmd_len++] = event.text.text[0];
           cmd_buf[cmd_len] = '\0';
+        }
+      }
+      if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN &&
+          event.button.button == SDL_BUTTON_LEFT) {
+        int mx = event.button.x;
+        int my = event.button.y;
+        int col = (mx - GUTTER_WIDTH) / CHAR_WIDTH;
+        if (col < 0) col = 0;
+        int row = my / CHAR_HEIGHT + scroll_row;
+        if (row >= buf.line_count) row = buf.line_count - 1;
+        if (row < 0) row = 0;
+        int line_len = (int)strlen(buf.lines[row]);
+        if (col > line_len) col = line_len;
+        cursor_row = row;
+        cursor_col = col;
+        cursor_col_target = col;
+        if (user.state == COMMAND) {
+          // Clicking in the status bar area focuses command input
+        } else if (user.state != INSERT) {
+          user.state = NORMAL;
         }
       }
       if (event.type == SDL_EVENT_KEY_DOWN) {
@@ -478,14 +611,14 @@ int main(int argc, char *argv[]) {
             }
             cursor_col_target = cursor_col;
           }
-          if (event.key.key == SDLK_K) {
+          if (event.key.key == SDLK_K && !(event.key.mod & SDL_KMOD_SHIFT)) {
             if (cursor_row != 0) {
               cursor_row--;
             }
             int line_len = strlen(buf.lines[cursor_row]);
             cursor_col = min(cursor_col_target, line_len);
           }
-          if (event.key.key == SDLK_J) {
+          if (event.key.key == SDLK_J && !(event.key.mod & SDL_KMOD_SHIFT)) {
             int count = prefix_count > 0 ? prefix_count : 1;
             for (int c = 0; c < count; c++) {
               if (cursor_row != buf.line_count - 1) {
@@ -501,6 +634,7 @@ int main(int argc, char *argv[]) {
           if (pending_operator != 0 && event.key.key != SDLK_D &&
               event.key.key != SDLK_Y) {
             pending_operator = 0;
+            pending_motion = 0;
           }
           if (event.key.key == SDLK_U) {
             undo(&buf, &cursor_row, &cursor_col);
@@ -582,11 +716,16 @@ int main(int argc, char *argv[]) {
             prefix_count *= 10;
           }
 
-          // SWITCHING MODE TO INSERT
+          // SWITCHING MODE TO INSERT / di motion
           if (event.key.key == SDLK_I) {
-            push_undo(&buf, cursor_row, cursor_col);
-            user.state = INSERT;
-            swallow_text = true;
+            if (pending_operator == 'd') {
+              pending_motion = 'i';
+              pending_operator = 0;
+            } else {
+              push_undo(&buf, cursor_row, cursor_col);
+              user.state = INSERT;
+              swallow_until = SDL_GetTicks() + 50;
+            }
           }
           // SWITCHING MODE TO VISUAL
           if (event.key.key == SDLK_V) {
@@ -594,15 +733,22 @@ int main(int argc, char *argv[]) {
             visual_anchor_col = cursor_col;
             user.state = VISUAL;
           }
-          if (event.key.key == SDLK_X) {
+          if (event.key.key == SDLK_X && (event.key.mod & SDL_KMOD_SHIFT)) {
+            // X — delete character backward
+            push_undo(&buf, cursor_row, cursor_col);
+            if (cursor_col > 0) {
+              buffer_delete_char(&buf, cursor_row, cursor_col);
+              cursor_col--;
+              lsp_change(lsp, &buf);
+            }
+          } else if (event.key.key == SDLK_X) {
+            // x — delete character forward
             push_undo(&buf, cursor_row, cursor_col);
             int count = prefix_count > 0 ? prefix_count : 1;
             for (int c = 0; c < count; c++) {
               int line_len = strlen(buf.lines[cursor_row]);
-              if (cursor_col >= line_len) {
-                break;
-              }
-              buffer_delete_char(&buf, cursor_row, cursor_col);
+              if (cursor_col >= line_len) break;
+              buffer_delete_char(&buf, cursor_row, cursor_col + 1);
             }
             prefix_count = 0;
             lsp_change(lsp, &buf);
@@ -636,6 +782,7 @@ int main(int argc, char *argv[]) {
           }
         } else {
           pending_operator = 0;
+          pending_motion = 0;
         }
         if (user.state == NORMAL) {
           // --- Paste Command ---
@@ -659,7 +806,7 @@ int main(int argc, char *argv[]) {
             buffer_insert_line(&buf, cursor_row);
             user.state = INSERT;
             cursor_col = 0;
-            swallow_text = true;
+            swallow_until = SDL_GetTicks() + 50;
             if (lsp)
               lsp_change(lsp, &buf);
           } else if (event.key.key == SDLK_O) {
@@ -668,7 +815,7 @@ int main(int argc, char *argv[]) {
             user.state = INSERT;
             cursor_row++;
             cursor_col = 0;
-            swallow_text = true;
+            swallow_until = SDL_GetTicks() + 50;
             if (lsp)
               lsp_change(lsp, &buf);
           }
@@ -677,16 +824,20 @@ int main(int argc, char *argv[]) {
             push_undo(&buf, cursor_row, cursor_col);
             cursor_col = strlen(buf.lines[cursor_row]);
             user.state = INSERT;
-            swallow_text = true;
+            swallow_until = SDL_GetTicks() + 50;
           } else if (event.key.key == SDLK_A) {
             // a — append after cursor
             push_undo(&buf, cursor_row, cursor_col);
             if (cursor_col < (int)strlen(buf.lines[cursor_row]))
               cursor_col++;
             user.state = INSERT;
-            swallow_text = true;
+            swallow_until = SDL_GetTicks() + 50;
           }
-          // gg → first line
+          // K — hover info
+          if (event.key.key == SDLK_K && (event.key.mod & SDL_KMOD_SHIFT)) {
+            if (lsp) lsp_request_hover(lsp, cursor_row, cursor_col);
+          }
+          // gg → first line, gd → go to definition
           if (event.key.key == SDLK_G && !(event.key.mod & SDL_KMOD_SHIFT)) {
             if (pending_g) {
               cursor_row = 0;
@@ -696,6 +847,9 @@ int main(int argc, char *argv[]) {
             } else {
               pending_g = 1;
             }
+          } else if (pending_g && event.key.key == SDLK_D) {
+            pending_g = 0;
+            if (lsp) lsp_request_definition(lsp, cursor_row, cursor_col);
           } else {
             pending_g = 0;
           }
@@ -738,6 +892,70 @@ int main(int argc, char *argv[]) {
             cursor_col = 0;
             cursor_col_target = 0;
           }
+          // J — join next line
+          if (event.key.key == SDLK_J && (event.key.mod & SDL_KMOD_SHIFT)) {
+            if (cursor_row < buf.line_count - 1) {
+              push_undo(&buf, cursor_row, cursor_col);
+              int cur_len = strlen(buf.lines[cursor_row]);
+              int next_len = strlen(buf.lines[cursor_row + 1]);
+              buf.lines[cursor_row] =
+                  realloc(buf.lines[cursor_row], cur_len + next_len + 1);
+              memcpy(buf.lines[cursor_row] + cur_len,
+                     buf.lines[cursor_row + 1], next_len + 1);
+              buffer_delete_line(&buf, cursor_row + 1);
+              lsp_change(lsp, &buf);
+            }
+          }
+        }
+      }
+      // Explorer mode: Enter opens file/dir, - goes up
+      if (exploring && user.state == NORMAL) {
+        if (event.key.key == SDLK_RETURN && !event.key.repeat &&
+            SDL_GetTicks() - last_enter_time > 100) {
+          last_enter_time = SDL_GetTicks();
+          char *line = buf.lines[cursor_row];
+          int len = strlen(line);
+          if (len > 0 && line[len - 1] == '/') {
+            char new_path[1024];
+            line[len - 1] = '\0';
+            snprintf(new_path, sizeof(new_path), "%s/%s", explore_dir, line);
+            line[len - 1] = '/';
+            strncpy(explore_dir, new_path, sizeof(explore_dir) - 1);
+            load_directory(&buf, explore_dir);
+            cursor_row = 0;
+            cursor_col = 0;
+          } else {
+            char full_path[1024];
+            // Trim trailing space from file entries
+            int flen = len;
+            while (flen > 0 && line[flen - 1] == ' ') flen--;
+            snprintf(full_path, sizeof(full_path), "%s/%.*s",
+                     explore_dir, flen, line);
+            if (lsp) { lsp_close(lsp); lsp_destroy(lsp); lsp = NULL; }
+            buffer_destroy(&buf);
+            buf = buffer_load(full_path);
+            strncpy(filename, full_path, sizeof(filename) - 1);
+            lsp = lsp_init(filename);
+            if (lsp) lsp_open(lsp, &buf);
+            exploring = 0;
+            cursor_row = 0;
+            cursor_col = 0;
+            cursor_col_target = 0;
+            scroll_row = 0;
+          }
+        }
+        if (event.key.key == SDLK_MINUS && !event.key.repeat) {
+          char *slash = strrchr(explore_dir, '/');
+          if (slash && slash != explore_dir) {
+            *slash = '\0';
+          } else if (slash == explore_dir) {
+            explore_dir[1] = '\0';
+          } else {
+            strncpy(explore_dir, "..", sizeof(explore_dir) - 1);
+          }
+          load_directory(&buf, explore_dir);
+          cursor_row = 0;
+          cursor_col = 0;
         }
       }
       if (user.state == INSERT) {
@@ -762,13 +980,13 @@ int main(int argc, char *argv[]) {
           last_comp_nav_time = SDL_GetTicks();
           completion_selected =
               (completion_selected - 1 + completion_count) % completion_count;
-        } else if (completion_count > 0 && event.key.key == SDLK_RETURN) {
+        } else if (completion_count > 0 && event.key.key == SDLK_RETURN && !event.key.repeat) {
           last_enter_time = SDL_GetTicks();
           CompletionItem *ci = &completions[completion_selected];
           char *ins = ci->insert;
           int ws = get_word_prefix_start(buf.lines[cursor_row], cursor_col);
           for (int i = ws; i < cursor_col; i++)
-            buffer_delete_char(&buf, cursor_row, ws);
+            buffer_delete_char(&buf, cursor_row, ws + 1);
           cursor_col = ws;
           for (int i = 0; ins[i]; i++) {
             buffer_insert_char(&buf, cursor_row, cursor_col, ins[i]);
@@ -787,11 +1005,12 @@ int main(int argc, char *argv[]) {
           cursor_col++;
           buffer_insert_char(&buf, cursor_row, cursor_col, ' ');
           cursor_col++;
-          swallow_text = true;
+          swallow_until = SDL_GetTicks() + 50;
           if (lsp) {
             lsp_change(lsp, &buf);
           }
         } else if (event.key.key == SDLK_RETURN &&
+                   !event.key.repeat &&
                    completion_count == 0 &&
                    SDL_GetTicks() - last_enter_time > 100) {
           last_enter_time = SDL_GetTicks();
@@ -818,16 +1037,36 @@ int main(int argc, char *argv[]) {
 
           cursor_row++;
           cursor_col = indent;
-          swallow_text = true;
+          swallow_until = SDL_GetTicks() + 50;
           if (lsp) {
             lsp_change(lsp, &buf);
           }
         } else if (event.key.key == SDLK_BACKSPACE &&
+                   !event.key.repeat &&
                    SDL_GetTicks() - last_bksp_time > 100) {
            last_bksp_time = SDL_GetTicks();
           if (cursor_col > 0) {
-            buffer_delete_char(&buf, cursor_row, cursor_col);
-            cursor_col--;
+            // Empty auto-pair: delete both brackets
+            if (cursor_col < (int)strlen(buf.lines[cursor_row]) &&
+                ((buf.lines[cursor_row][cursor_col - 1] == '(' &&
+                  buf.lines[cursor_row][cursor_col] == ')') ||
+                 (buf.lines[cursor_row][cursor_col - 1] == '{' &&
+                  buf.lines[cursor_row][cursor_col] == '}') ||
+                 (buf.lines[cursor_row][cursor_col - 1] == '[' &&
+                  buf.lines[cursor_row][cursor_col] == ']') ||
+                 (buf.lines[cursor_row][cursor_col - 1] == '"' &&
+                  buf.lines[cursor_row][cursor_col] == '"') ||
+                 (buf.lines[cursor_row][cursor_col - 1] == '\'' &&
+                  buf.lines[cursor_row][cursor_col] == '\''))) {
+              buffer_delete_char(&buf, cursor_row, cursor_col + 1);
+              cursor_col--;
+              buffer_delete_char(&buf, cursor_row, cursor_col + 1);
+              if (lsp) lsp_change(lsp, &buf);
+            } else {
+              buffer_delete_char(&buf, cursor_row, cursor_col);
+              cursor_col--;
+              if (lsp) lsp_change(lsp, &buf);
+            }
           } else if (cursor_row > 0) {
             int prev_len = strlen(buf.lines[cursor_row - 1]);
             int cur_len = strlen(buf.lines[cursor_row]);
@@ -842,6 +1081,54 @@ int main(int argc, char *argv[]) {
           }
           if (base_count > 0)
             filter_completions(buf.lines[cursor_row], cursor_col);
+        } else if (event.key.key == SDLK_DELETE && !event.key.repeat) {
+          // Del — delete forward
+          int line_len = strlen(buf.lines[cursor_row]);
+          if (cursor_col < line_len) {
+            buffer_delete_char(&buf, cursor_row, cursor_col + 1);
+            if (lsp) lsp_change(lsp, &buf);
+          } else if (cursor_row < buf.line_count - 1) {
+            int cur_len = strlen(buf.lines[cursor_row]);
+            int next_len = strlen(buf.lines[cursor_row + 1]);
+            buf.lines[cursor_row] =
+                realloc(buf.lines[cursor_row], cur_len + next_len + 1);
+            memcpy(buf.lines[cursor_row] + cur_len,
+                   buf.lines[cursor_row + 1], next_len + 1);
+            buffer_delete_line(&buf, cursor_row + 1);
+            if (lsp) lsp_change(lsp, &buf);
+          }
+        } else if (event.key.key == SDLK_W && (event.key.mod & SDL_KMOD_CTRL)) {
+          // Ctrl+w — delete word backward
+          int ws = cursor_col;
+          while (ws > 0 && buf.lines[cursor_row][ws - 1] == ' ') ws--;
+          while (ws > 0 && is_word_char(buf.lines[cursor_row][ws - 1])) ws--;
+          for (int i = ws; i < cursor_col; i++)
+            buffer_delete_char(&buf, cursor_row, ws + 1);
+          cursor_col = ws;
+          swallow_until = SDL_GetTicks() + 50;
+          if (lsp) lsp_change(lsp, &buf);
+        } else if (event.key.key == SDLK_U && (event.key.mod & SDL_KMOD_CTRL)) {
+          // Ctrl+u — delete to start of line
+          for (int i = 0; i < cursor_col; i++)
+            buffer_delete_char(&buf, cursor_row, 1);
+          cursor_col = 0;
+          swallow_until = SDL_GetTicks() + 50;
+          if (lsp) lsp_change(lsp, &buf);
+        } else if (event.key.key == SDLK_S && (event.key.mod & SDL_KMOD_CTRL)) {
+          // Ctrl+s — save
+          buffer_save(&buf, filename);
+          save_feedback_time = SDL_GetTicks();
+          swallow_until = SDL_GetTicks() + 50;
+        } else if (event.key.key == SDLK_C && (event.key.mod & SDL_KMOD_CTRL)) {
+          // Ctrl+c — exit to NORMAL
+          user.state = NORMAL;
+          swallow_until = SDL_GetTicks() + 50;
+        } else if (event.key.key == SDLK_SPACE && (event.key.mod & SDL_KMOD_CTRL)) {
+          // Ctrl+Space — manual completion trigger
+          if (lsp) {
+            lsp_request_completion(lsp, cursor_row, cursor_col);
+            last_completion_time = SDL_GetTicks();
+          }
         }
       }
       if (user.state == VISUAL) {
@@ -964,7 +1251,8 @@ int main(int argc, char *argv[]) {
         }
       }
       if (user.state == COMMAND) {
-        if (event.key.key == SDLK_RETURN) {
+        if (event.key.key == SDLK_RETURN && !event.key.repeat) {
+          last_enter_time = SDL_GetTicks();
           if (cmd_buf[0] == '/' && cmd_len > 1) {
             strncpy(last_search, cmd_buf + 1, 255);
             int nr, nc;
@@ -1005,23 +1293,35 @@ int main(int argc, char *argv[]) {
           } else if (strcmp(cmd_buf, ":w!") == 0) {
             buffer_save(&buf, filename);
             save_feedback_time = SDL_GetTicks();
+          } else if (strcmp(cmd_buf, ":e") == 0) {
+            strncpy(explore_dir, ".", sizeof(explore_dir) - 1);
+            exploring = 1;
+            if (lsp) { lsp_close(lsp); lsp_destroy(lsp); lsp = NULL; }
+            buffer_destroy(&buf);
+            buf = buffer_create(100);
+            load_directory(&buf, explore_dir);
+            cursor_row = 0;
+            cursor_col = 0;
+            cursor_col_target = 0;
+            scroll_row = 0;
           }
           user.state = NORMAL;
         }
-        if (event.key.key == SDLK_BACKSPACE && cmd_len > 0) {
+        if (event.key.key == SDLK_BACKSPACE && !event.key.repeat &&
+            cmd_len > 0 && SDL_GetTicks() - last_bksp_time > 100) {
+          last_bksp_time = SDL_GetTicks();
           cmd_buf[--cmd_len] = '\0';
         }
       }
     }
 
     /* ── Background ─────────────────────────────── */
-    SDL_SetRenderDrawColor(renderer, 20, 20, 20, 255);
+    SDL_SetRenderDrawColor(renderer, 25, 23, 36, 255);
     SDL_RenderClear(renderer);
 
-    SDL_SetTextureColorMod(fontTexture, 255, 255, 255);
+    SDL_SetTextureColorMod(fontTexture, 144, 140, 170);
     /* ── Gutter (line numbers) ──────────────────── */
-    const int GUTTER_WIDTH = 4 * CHAR_WIDTH;
-    SDL_SetRenderDrawColor(renderer, 30, 30, 30, 255);
+    SDL_SetRenderDrawColor(renderer, 31, 29, 46, 255);
     SDL_FRect gutter_rect = {0, 0, (float)GUTTER_WIDTH, (float)h};
     SDL_RenderFillRect(renderer, &gutter_rect);
 
@@ -1051,7 +1351,7 @@ int main(int argc, char *argv[]) {
 
       for (int d = 0; d < diag_count; d++) {
         if (diagnostics[d].line == i) {
-          SDL_SetRenderDrawColor(renderer, 255, 60, 60, 255);
+          SDL_SetRenderDrawColor(renderer, 235, 111, 146, 255);
           SDL_FRect dot = {(float)CHAR_WIDTH, y + (float)CHAR_HEIGHT / 2 - 2, 6,
                            4};
           SDL_RenderFillRect(renderer, &dot);
@@ -1088,7 +1388,7 @@ int main(int argc, char *argv[]) {
               selected = true;
           }
           if (selected) {
-            SDL_SetRenderDrawColor(renderer, 60, 60, 120, 255);
+            SDL_SetRenderDrawColor(renderer, 64, 61, 82, 255);
             SDL_FRect bg = {GUTTER_WIDTH + j * CHAR_WIDTH, y, CHAR_WIDTH,
                             CHAR_HEIGHT};
             SDL_RenderFillRect(renderer, &bg);
@@ -1097,24 +1397,24 @@ int main(int argc, char *argv[]) {
         int color = classify_char(buf.lines[i], j);
         switch (color) {
         case 1:
-          SDL_SetTextureColorMod(fontTexture, 230, 180, 80);
+          SDL_SetTextureColorMod(fontTexture, 196, 167, 231);
           break;
         case 2:
-          SDL_SetTextureColorMod(fontTexture, 100, 130, 100);
+          SDL_SetTextureColorMod(fontTexture, 144, 140, 170);
           break;
         case 3:
-          SDL_SetTextureColorMod(fontTexture, 150, 200, 150);
+          SDL_SetTextureColorMod(fontTexture, 156, 207, 216);
           break;
         case 4:
-          SDL_SetTextureColorMod(fontTexture, 200, 160, 100);
+          SDL_SetTextureColorMod(fontTexture, 246, 193, 119);
           break;
         default:
-          SDL_SetTextureColorMod(fontTexture, 255, 255, 255);
+          SDL_SetTextureColorMod(fontTexture, 224, 222, 244);
           break;
         }
         DrawChar(renderer, fontTexture, buf.lines[i][j],
                  GUTTER_WIDTH + j * CHAR_WIDTH, y);
-        SDL_SetTextureColorMod(fontTexture, 255, 255, 255);
+        SDL_SetTextureColorMod(fontTexture, 224, 222, 244);
       }
     }
 
@@ -1124,6 +1424,51 @@ int main(int argc, char *argv[]) {
       if (pending) {
         JsonValue *result = json_get(pending, "result");
         if (result) {
+          // Hover response
+          JsonValue *contents = json_get(result, "contents");
+          if (contents) {
+            JsonValue *value = json_get(contents, "value");
+            if (value && value->type == JSON_STR) {
+              snprintf(status_msg, sizeof(status_msg), "%s", value->string);
+              status_msg_time = SDL_GetTicks();
+            } else if (contents->type == JSON_STR) {
+              snprintf(status_msg, sizeof(status_msg), "%s", contents->string);
+              status_msg_time = SDL_GetTicks();
+            }
+          }
+          // Definition response (array of locations)
+          if (result->type == JSON_ARR) {
+            JsonValue *loc = NULL;
+            for (int i = 0; i < result->arr.count; i++) {
+              JsonValue *item = result->arr.items[i];
+              JsonValue *range = json_get(item, "range");
+              JsonValue *start = range ? json_get(range, "start") : NULL;
+              JsonValue *line = start ? json_get(start, "line") : NULL;
+              if (line && line->type == JSON_NUM) {
+                loc = result->arr.items[i];
+                break;
+              }
+            }
+            if (loc) {
+              JsonValue *range = json_get(loc, "range");
+              JsonValue *start = range ? json_get(range, "start") : NULL;
+              JsonValue *line = start ? json_get(start, "line") : NULL;
+              JsonValue *ch = start ? json_get(start, "character") : NULL;
+              if (line && line->type == JSON_NUM) {
+                cursor_row = (int)line->number;
+                cursor_col = ch && ch->type == JSON_NUM ? (int)ch->number : 0;
+                cursor_col_target = cursor_col;
+                snprintf(status_msg, sizeof(status_msg),
+                         "Go to definition");
+                status_msg_time = SDL_GetTicks();
+              }
+            } else {
+              snprintf(status_msg, sizeof(status_msg),
+                       "No definition found");
+              status_msg_time = SDL_GetTicks();
+            }
+          }
+          // Completion response
           JsonValue *items = json_get(result, "items");
           if (items && items->type == JSON_ARR) {
             base_count = 0;
@@ -1134,8 +1479,6 @@ int main(int argc, char *argv[]) {
               if (label && label->type == JSON_STR) {
                 CompletionItem *ci = &base_completions[base_count];
                 strncpy(ci->label, label->string, 255);
-
-                // Prefer textEdit.newText, then insertText, then filterText, then label
                 JsonValue *te = json_get(item, "textEdit");
                 JsonValue *tn = te ? json_get(te, "newText") : NULL;
                 if (tn && tn->type == JSON_STR)
@@ -1152,7 +1495,6 @@ int main(int argc, char *argv[]) {
                       strncpy(ci->insert, label->string, 255);
                   }
                 }
-
                 if (detail && detail->type == JSON_STR)
                   strncpy(ci->detail, detail->string, 255);
                 else
@@ -1218,12 +1560,12 @@ int main(int argc, char *argv[]) {
     if (cursor_visible) {
       if (user.state == INSERT) {
         // thin vertical bar
-        SDL_SetRenderDrawColor(renderer, 100, 255, 100, 255);
+        SDL_SetRenderDrawColor(renderer, 156, 207, 216, 255);
         SDL_FRect cursor_rect = {cursor.x, cursor.y, 2.0f, (float)CHAR_HEIGHT};
         SDL_RenderFillRect(renderer, &cursor_rect);
       } else {
         // full block (NORMAL, COMMAND, VISUAL)
-        SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
+        SDL_SetRenderDrawColor(renderer, 224, 222, 244, 255);
         SDL_FRect cursor_rect = {cursor.x, cursor.y, (float)CHAR_WIDTH,
                                  (float)CHAR_HEIGHT};
         SDL_RenderFillRect(renderer, &cursor_rect);
@@ -1232,63 +1574,132 @@ int main(int argc, char *argv[]) {
 
     /* ── Status bar ─────────────────────────────── */
     float status_y = h - CHAR_HEIGHT;
-    SDL_SetRenderDrawColor(renderer, 40, 40, 40, 255);
+    SDL_SetRenderDrawColor(renderer, 31, 29, 46, 255);
     SDL_FRect status_rect = {0, status_y, (float)w, (float)CHAR_HEIGHT};
     SDL_RenderFillRect(renderer, &status_rect);
 
     const char *mode_str = "";
+    Uint8 mode_r = 196, mode_g = 167, mode_b = 231;
     switch (user.state) {
     case NORMAL:
       mode_str = "NORMAL";
-      break;
+      mode_r = 196; mode_g = 167; mode_b = 231; break;
     case INSERT:
       mode_str = "INSERT";
-      break;
+      mode_r = 156; mode_g = 207; mode_b = 216; break;
     case VISUAL:
       mode_str = "VISUAL";
-      break;
+      mode_r = 235; mode_g = 111; mode_b = 146; break;
     case COMMAND:
       mode_str = "COMMAND";
-      break;
+      mode_r = 246; mode_g = 193; mode_b = 119; break;
     }
 
-    char status[512] = {0};
+    int sx = CHAR_WIDTH;
+    int offset = 0;
+
     if (status_msg[0] && SDL_GetTicks() - status_msg_time < 2000) {
-      snprintf(status, sizeof(status), "%s", status_msg);
+      int is_err = strstr(status_msg, "not found") != NULL;
+      Uint8 r = is_err ? 235 : 196, g = is_err ? 111 : 167, b = is_err ? 146 : 231;
+      SDL_SetTextureColorMod(fontTexture, r, g, b);
+      for (int j = 0; status_msg[j]; j++) {
+        DrawChar(renderer, fontTexture, status_msg[j],
+                 sx + offset * CHAR_WIDTH, status_y);
+        offset++;
+      }
     } else {
       status_msg[0] = '\0';
     }
-    if (!status[0]) {
+
+    if (offset == 0) {
       if (save_feedback_time && SDL_GetTicks() - save_feedback_time < 1500) {
-        snprintf(status, sizeof(status), "saved!  |  %s",
-                 filename ? filename : "(new)");
+        char tmp[512];
+        snprintf(tmp, sizeof(tmp), "saved!  |  %s",
+                 filename[0] ? filename : "(new)");
+        SDL_SetTextureColorMod(fontTexture, 156, 207, 216);
+        for (int j = 0; tmp[j]; j++) {
+          DrawChar(renderer, fontTexture, tmp[j],
+                   sx + offset * CHAR_WIDTH, status_y);
+          offset++;
+        }
       } else {
         save_feedback_time = 0;
       }
     }
-    if (!status[0]) {
+
+    if (offset == 0) {
       if (user.state == COMMAND) {
-        snprintf(status, sizeof(status), "%s", cmd_buf);
+        SDL_SetTextureColorMod(fontTexture, mode_r, mode_g, mode_b);
+        for (int j = 0; cmd_buf[j]; j++) {
+          DrawChar(renderer, fontTexture, cmd_buf[j],
+                   sx + offset * CHAR_WIDTH, status_y);
+          offset++;
+        }
+      } else if (exploring) {
+        SDL_SetTextureColorMod(fontTexture, 144, 140, 170);
+        for (int j = 0; explore_dir[j]; j++) {
+          DrawChar(renderer, fontTexture, explore_dir[j],
+                   sx + offset * CHAR_WIDTH, status_y);
+          offset++;
+        }
+        char sep[] = "  |  ";
+        for (int j = 0; sep[j]; j++) {
+          DrawChar(renderer, fontTexture, sep[j],
+                   sx + offset * CHAR_WIDTH, status_y);
+          offset++;
+        }
+        SDL_SetTextureColorMod(fontTexture, mode_r, mode_g, mode_b);
+        for (int j = 0; mode_str[j]; j++) {
+          DrawChar(renderer, fontTexture, mode_str[j],
+                   sx + offset * CHAR_WIDTH, status_y);
+          offset++;
+        }
       } else {
-        snprintf(status, sizeof(status), "%s  |  Line %d, Col %d  |  %s",
-                 filename ? filename : "(new)", cursor_row + 1, cursor_col + 1,
-                 mode_str);
+        const char *fn = filename[0] ? filename : "(new)";
+        SDL_SetTextureColorMod(fontTexture, 156, 207, 216);
+        for (int j = 0; fn[j]; j++) {
+          DrawChar(renderer, fontTexture, fn[j],
+                   sx + offset * CHAR_WIDTH, status_y);
+          offset++;
+        }
+        char pos[64];
+        snprintf(pos, sizeof(pos), "  |  Line %d, Col %d  |  ",
+                 cursor_row + 1, cursor_col + 1);
+        SDL_SetTextureColorMod(fontTexture, 144, 140, 170);
+        for (int j = 0; pos[j]; j++) {
+          DrawChar(renderer, fontTexture, pos[j],
+                   sx + offset * CHAR_WIDTH, status_y);
+          offset++;
+        }
+        SDL_SetTextureColorMod(fontTexture, mode_r, mode_g, mode_b);
+        for (int j = 0; mode_str[j]; j++) {
+          DrawChar(renderer, fontTexture, mode_str[j],
+                   sx + offset * CHAR_WIDTH, status_y);
+          offset++;
+        }
         for (int d = 0; d < diag_count; d++) {
           if (diagnostics[d].line == cursor_row) {
-            int sl = strlen(status);
-            snprintf(status + sl, sizeof(status) - sl, "  |  %s: %s",
+            char diag[512];
+            snprintf(diag, sizeof(diag), "  |  %s: %s",
                      diagnostics[d].severity == 1 ? "ERR" : "WARN",
                      diagnostics[d].message);
+            if (diagnostics[d].severity == 1) {
+              SDL_SetTextureColorMod(fontTexture, 235, 111, 146);
+            } else {
+              SDL_SetTextureColorMod(fontTexture, 246, 193, 119);
+            }
+            for (int j = 0; diag[j]; j++) {
+              DrawChar(renderer, fontTexture, diag[j],
+                       sx + offset * CHAR_WIDTH, status_y);
+              offset++;
+            }
             break;
           }
         }
       }
     }
 
-    int sx = CHAR_WIDTH;
-    for (int j = 0; status[j]; j++) {
-      DrawChar(renderer, fontTexture, status[j], sx + j * CHAR_WIDTH, status_y);
-    }
+    SDL_SetTextureColorMod(fontTexture, 224, 222, 244);
 
     /* ── Completion popup ───────────────────────── */
     if (completion_count > 0 && user.state == INSERT) {
@@ -1300,10 +1711,10 @@ int main(int argc, char *argv[]) {
       int popup_h = vis * CHAR_HEIGHT;
       if (popup_y + popup_h > text_area_height)
         popup_y = cursor.y - popup_h;
-      SDL_SetRenderDrawColor(renderer, 45, 45, 55, 255);
+      SDL_SetRenderDrawColor(renderer, 38, 35, 58, 255);
       SDL_FRect bg = {popup_x, popup_y, popup_w, popup_h};
       SDL_RenderFillRect(renderer, &bg);
-      SDL_SetRenderDrawColor(renderer, 80, 80, 90, 255);
+      SDL_SetRenderDrawColor(renderer, 82, 79, 103, 255);
       SDL_RenderRect(renderer, &bg);
 
       int start_idx = 0;
@@ -1315,17 +1726,17 @@ int main(int argc, char *argv[]) {
         if (idx >= completion_count) break;
         int y_pos = popup_y + i * CHAR_HEIGHT;
         if (idx == completion_selected) {
-          SDL_SetRenderDrawColor(renderer, 65, 65, 130, 255);
+          SDL_SetRenderDrawColor(renderer, 64, 61, 82, 255);
           SDL_FRect sel = {popup_x, y_pos, popup_w, CHAR_HEIGHT};
           SDL_RenderFillRect(renderer, &sel);
         }
-        SDL_SetTextureColorMod(fontTexture, 220, 220, 220);
+        SDL_SetTextureColorMod(fontTexture, 224, 222, 244);
         for (int j = 0; completions[idx].label[j]; j++) {
           DrawChar(renderer, fontTexture, completions[idx].label[j],
                    popup_x + j * CHAR_WIDTH, y_pos);
         }
         if (completions[idx].detail[0]) {
-          SDL_SetTextureColorMod(fontTexture, 150, 150, 150);
+          SDL_SetTextureColorMod(fontTexture, 144, 140, 170);
           int det_x = popup_x + (30 * CHAR_WIDTH);
           for (int j = 0; completions[idx].detail[j]; j++) {
             DrawChar(renderer, fontTexture, completions[idx].detail[j],
@@ -1333,14 +1744,16 @@ int main(int argc, char *argv[]) {
           }
         }
       }
-      SDL_SetTextureColorMod(fontTexture, 255, 255, 255);
+      SDL_SetTextureColorMod(fontTexture, 224, 222, 244);
     }
 
     /* ── Present ────────────────────────────────── */
     SDL_RenderPresent(renderer);
   }
-  if (lsp)
+  if (lsp) {
+    lsp_close(lsp);
     lsp_destroy(lsp);
+  }
   buffer_destroy(&buf);
   TTF_CloseFont(font);
   SDL_DestroyRenderer(renderer);

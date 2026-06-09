@@ -319,17 +319,50 @@ JsonValue *lsp_get_pending_result(LspClient *lc) {
 void lsp_request_completion(LspClient *lc, int line, int col) {
   lc->request_id++;
   lc->pending_id = lc->request_id;
-
-  if (lc->pending_result) {
-    json_free(lc->pending_result);
-    lc->pending_result = NULL;
-  }
+  if (lc->pending_result) { json_free(lc->pending_result); lc->pending_result = NULL; }
   char body[4096];
   snprintf(body, sizeof(body),
-           "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"textDocument/"
-           "completion\",\"params\":"
-           "{\"textDocument\":{\"uri\":\"%s\"},\"position\":{\"line\":%d,"
-           "\"character\":%d}}}",
-           lc->request_id, lc->file_uri, line, col);
+    "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"textDocument/"
+    "completion\",\"params\":"
+    "{\"textDocument\":{\"uri\":\"%s\"},\"position\":{\"line\":%d,"
+    "\"character\":%d}}}",
+    lc->request_id, lc->file_uri, line, col);
+  send_data(lc, body);
+}
+
+void lsp_request_hover(LspClient *lc, int line, int col) {
+  lc->request_id++;
+  lc->pending_id = lc->request_id;
+  if (lc->pending_result) { json_free(lc->pending_result); lc->pending_result = NULL; }
+  char body[4096];
+  snprintf(body, sizeof(body),
+    "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"textDocument/"
+    "hover\",\"params\":"
+    "{\"textDocument\":{\"uri\":\"%s\"},\"position\":{\"line\":%d,"
+    "\"character\":%d}}}",
+    lc->request_id, lc->file_uri, line, col);
+  send_data(lc, body);
+}
+
+void lsp_request_definition(LspClient *lc, int line, int col) {
+  lc->request_id++;
+  lc->pending_id = lc->request_id;
+  if (lc->pending_result) { json_free(lc->pending_result); lc->pending_result = NULL; }
+  char body[4096];
+  snprintf(body, sizeof(body),
+    "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"textDocument/"
+    "definition\",\"params\":"
+    "{\"textDocument\":{\"uri\":\"%s\"},\"position\":{\"line\":%d,"
+    "\"character\":%d}}}",
+    lc->request_id, lc->file_uri, line, col);
+  send_data(lc, body);
+}
+
+void lsp_close(LspClient *lc) {
+  char body[4096];
+  snprintf(body, sizeof(body),
+    "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didClose\",\"params\":"
+    "{\"textDocument\":{\"uri\":\"%s\"}}}",
+    lc->file_uri);
   send_data(lc, body);
 }

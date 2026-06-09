@@ -36,8 +36,8 @@ make run
 ## Todos:
 - [x] Add Visual Mode with highlighting (still needs improvment)
 - [x] Add more Vim keymaps (still needs more keymaps)
-- [ ] Add relative line number
-- [ ] Integrate LSP (clangd) for the editor with a formater
-- [ ] Have the usableity like tmux and
+- [x] Add relative line number
+- [x] Integrate LSP (clangd) for the editor with a formater
+- [ ] Have the usableity like tmux and ... 
 - [ ] Make Worknig With multi buffers better
 - [ ] Add Settings And Themes

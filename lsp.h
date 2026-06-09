@@ -32,5 +32,8 @@ JsonValue *lsp_poll_message(LspClient *lc);
 void lsp_destroy(LspClient *lc);
 void lsp_request_completion(LspClient *lc, int line, int col);
 JsonValue *lsp_get_pending_result(LspClient *lc);
+void lsp_request_hover(LspClient *lc, int line, int col);
+void lsp_request_definition(LspClient *lc, int line, int col);
+void lsp_close(LspClient *lc);
 
 #endif
