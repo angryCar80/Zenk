@@ -9,6 +9,7 @@ typedef struct {
   char **lines;
   int line_count;
   int capacity;
+  int dirty;
 } Buffer;
 
 Buffer buffer_create(int initial_capacity);

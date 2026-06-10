@@ -5,6 +5,7 @@ Buffer buffer_create(int initial_capacity) {
   Buffer buf;
   buf.capacity = initial_capacity;
   buf.line_count = 1;
+  buf.dirty = 0;
   buf.lines = malloc(sizeof(char *) * initial_capacity);
   buf.lines[0] = malloc(1);
   buf.lines[0][0] = '\0';
@@ -31,6 +32,7 @@ void buffer_insert_char(Buffer *buf, int row, int col, char c) {
 
   memmove(line + col + 1, line + col, len - col + 1);
   line[col] = c;
+  buf->dirty = 1;
 }
 
 void buffer_delete_char(Buffer *buf, int row, int col) {
@@ -39,11 +41,12 @@ void buffer_delete_char(Buffer *buf, int row, int col) {
   if (col <= 0)
     return;
 
-  if (col <= 0 || col > len)
+  if (col > len)
     return;
 
   memmove(line + col - 1, line + col, len - col + 1);
   buf->lines[row] = realloc(line, len);
+  buf->dirty = 1;
 }
 
 void buffer_insert_line(Buffer *buf, int row) {
@@ -59,6 +62,7 @@ void buffer_insert_line(Buffer *buf, int row) {
   buf->lines[row][0] = '\0';
 
   buf->line_count++;
+  buf->dirty = 1;
 }
 
 Buffer buffer_load(const char *path) {
@@ -68,6 +72,7 @@ Buffer buffer_load(const char *path) {
 
   char line[4096];
   Buffer buf = buffer_create(100);
+  buf.dirty = 0;
   if (fgets(line, sizeof(line), f)) {
     line[strcspn(line, "\n")] = '\0';
     free(buf.lines[0]);
@@ -100,6 +105,7 @@ void buffer_save(Buffer *buf, const char *path) {
     fprintf(f, "%s\n", buf->lines[i]);
   }
   fclose(f);
+  buf->dirty = 0;
 }
 
 void buffer_delete_line(Buffer *buf, int row) {
@@ -112,6 +118,7 @@ void buffer_delete_line(Buffer *buf, int row) {
           sizeof(char *) * (buf->line_count - row - 1));
 
   buf->line_count--;
+  buf->dirty = 1;
 }
 
 Buffer buffer_clone(Buffer *src) {
@@ -121,6 +128,7 @@ Buffer buffer_clone(Buffer *src) {
   c.lines = malloc(sizeof(char *) * c.capacity);
   for (int i = 0; i < c.line_count; i++)
     c.lines[i] = strdup(src->lines[i]);
+  c.dirty = src->dirty;
   return c;
 }
 

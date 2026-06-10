@@ -4,3 +4,5 @@ default:
 
 run:
 	./build/zenk
+install:
+	cp build/zenk ~/.local/bin/

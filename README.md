@@ -39,5 +39,5 @@ make run
 - [x] Add relative line number
 - [x] Integrate LSP (clangd) for the editor with a formater
 - [ ] Have the usableity like tmux and ... 
-- [ ] Make Worknig With multi buffers better
+- [x] Make Worknig With multi buffers better
 - [ ] Add Settings And Themes
